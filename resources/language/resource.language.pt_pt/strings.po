@@ -147,3 +147,7 @@ msgstr "Removido dos favoritos"
 msgctxt "#32032"
 msgid "Could not log in"
 msgstr "Não foi possível iniciar sessão"
+
+msgctxt "#32033"
+msgid "Items per page"
+msgstr "Itens por página"

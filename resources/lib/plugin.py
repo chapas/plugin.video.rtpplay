@@ -1,4 +1,5 @@
 import json
+import math
 import re
 import routing
 import logging
@@ -7,7 +8,7 @@ import xbmcaddon
 from resources.lib import kodiutils
 from resources.lib import kodilogging
 from xbmcgui import ListItem, Dialog, DialogProgress, Window, INPUT_ALPHANUM
-from xbmcplugin import addDirectoryItem, endOfDirectory, setResolvedUrl
+from xbmcplugin import addDirectoryItem, endOfDirectory, setResolvedUrl, addSortMethod, SORT_METHOD_LABEL, SORT_METHOD_NONE
 
 from . import rtpplay
 from .rtpaccount import Account, LoginError
@@ -152,27 +153,56 @@ def programs():
 
 @plugin.route('/programs/category')
 def programs_category():
-    page = int(plugin.args["page"][0])
     slug = plugin.args["slug"][0]
     cat_name = plugin.args["name"][0]
-    # Resolved once on the first page and carried along; "all programs" has no id
+    page = int(plugin.args.get("page", [1])[0])
+
+    # Resolved once and carried along; "all programs" has no id
     if "id" in plugin.args:
         cat_id = plugin.args["id"][0]
     else:
         cat_id = rtpplay.get_category_id(slug)
 
-    pagei = ListItem("[B]{}[/B] - {} {}".format(cat_name, kodiutils.get_string(32009), page))
-    pagei.setProperty('IsPlayable', 'false')
-    addDirectoryItem(handle=plugin.handle, listitem=pagei, isFolder=False, url="")
+    # Configured items per page: 10, 20, 30, 40, or 50 (default 30)
+    page_size = kodiutils.get_setting_as_int("items_per_page")
+    if page_size not in (10, 20, 30, 40, 50):
+        page_size = 30
 
-    items = rtpplay.list_programs(cat_id, page)
-    favorite_keys = get_favorite_keys()
+    items = rtpplay.list_all_category_programs(cat_id)
     seen = set()
+    unique_items = []
     for program in items:
-        # The site sometimes lists the same program twice in a row
+        # The site sometimes lists the same program twice
         if program["program_id"] in seen:
             continue
         seen.add(program["program_id"])
+        unique_items.append(program)
+
+    total_items = len(unique_items)
+    total_pages = max(1, math.ceil(total_items / page_size))
+    if page > total_pages:
+        page = total_pages
+    if page < 1:
+        page = 1
+
+    start_idx = (page - 1) * page_size
+    end_idx = start_idx + page_size
+    page_items = unique_items[start_idx:end_idx]
+
+    favorite_keys = get_favorite_keys()
+
+    # Previous page button
+    if page > 1:
+        prev_page = page - 1
+        prev_label = "<<< {} {}/{}".format(
+            kodiutils.get_string(32009), prev_page, total_pages)
+        prev_item = ListItem(prev_label)
+        prev_item.setArt({"icon": ICON, "thumb": ICON, "fanart": kodiutils.FANART})
+        addDirectoryItem(handle=plugin.handle, listitem=prev_item, isFolder=True,
+                         url=plugin.url_for(programs_category, name=cat_name, slug=slug,
+                                            id=cat_id, page=prev_page))
+
+    for program in page_items:
         title = program["title"] or program["meta"]
         img = program["image"]
 
@@ -194,14 +224,18 @@ def programs_category():
                 page=1
             ), liz, True)
 
-    if len(items) >= PAGE_SIZE:
-        newpage = str(page + 1)
-        nextpage = ListItem("[B]{}[/B] - {} {} >>>".format(cat_name,
-                                                           kodiutils.get_string(32009), newpage))
-        addDirectoryItem(handle=plugin.handle, listitem=nextpage, isFolder=True,
+    # Next page button
+    if end_idx < total_items:
+        next_page = page + 1
+        next_label = "{} {}/{} >>>".format(
+            kodiutils.get_string(32009), next_page, total_pages)
+        next_item = ListItem(next_label)
+        next_item.setArt({"icon": ICON, "thumb": ICON, "fanart": kodiutils.FANART})
+        addDirectoryItem(handle=plugin.handle, listitem=next_item, isFolder=True,
                          url=plugin.url_for(programs_category, name=cat_name, slug=slug,
-                                            id=cat_id, page=newpage))
+                                            id=cat_id, page=next_page))
 
+    addSortMethod(plugin.handle, SORT_METHOD_NONE)
     endOfDirectory(plugin.handle)
 
 
@@ -247,12 +281,14 @@ def add_episode(episode, program_title, program_img, context_menu=None):
         label = "{} ({})".format(label, episode["date"])
     img = episode["image"] or program_img
 
+    is_audio = episode.get("audio", False)
     liz = ListItem(label)
     liz.setArt({"thumb": img,
                 "icon": img,
                 "fanart": kodiutils.FANART})
-    liz.setInfo("Video", infoLabels={"plot": episode["description"] or episode["subtitle"] or episode["link_title"],
-                                     "title": label})
+    liz.setInfo("Music" if is_audio else "Video",
+                infoLabels={"plot": episode["description"] or episode["subtitle"] or episode["link_title"],
+                            "title": label})
     liz.setProperty('IsPlayable', 'true')
     if context_menu:
         liz.addContextMenuItems(context_menu)
@@ -272,14 +308,18 @@ def add_episode(episode, program_title, program_img, context_menu=None):
 @plugin.route('/programs/play')
 def programs_play():
     title = plugin.args["title"][0]
-    img = plugin.args["img"][0]
+    img = plugin.args.get("img", [""])[0]
     episode_id = plugin.args["episode_id"][0]
     prog_id = plugin.args["prog_id"][0]
     slug = plugin.args["slug"][0]
 
     liz = ListItem(title)
-    liz.setArt({"thumb": img, "icon": img})
+    if img:
+        liz.setArt({"thumb": img, "icon": img})
     stream = rtpplay.get_episode_stream(prog_id, episode_id, slug)
+    if stream:
+        liz.setInfo("Music" if stream.media_type == "audio" else "Video",
+                    infoLabels={"title": title})
     if stream and stream.telemetry and account.logged_in:
         resume_ms = ask_resume(stream.telemetry, always_resume="resume" in plugin.args)
         if resume_ms is None:

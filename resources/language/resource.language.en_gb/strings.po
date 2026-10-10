@@ -147,3 +147,7 @@ msgstr ""
 msgctxt "#32032"
 msgid "Could not log in"
 msgstr ""
+
+msgctxt "#32033"
+msgid "Items per page"
+msgstr ""

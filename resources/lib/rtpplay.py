@@ -9,6 +9,7 @@
 import base64
 import html
 import re
+import unicodedata
 from urllib.parse import unquote, urlencode
 
 import requests
@@ -16,8 +17,23 @@ import requests
 BASE_URL = "https://www.rtp.pt"
 
 # The streaming servers return an empty 204 response to unknown user agents
-USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Safari/537.36"
-HEADERS = {"User-Agent": USER_AGENT}
+USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
+
+# Full modern desktop browser headers
+HEADERS = {
+    "User-Agent": USER_AGENT,
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language": "pt-PT,pt;q=0.9,en-US;q=0.8,en;q=0.7",
+    "DNT": "1",
+    "Upgrade-Insecure-Requests": "1",
+}
+
+import urllib.request
+import urllib.parse
+from http.cookiejar import CookieJar
+
+_COOKIE_JAR = CookieJar()
+_URL_OPENER = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(_COOKIE_JAR))
 
 WIDEVINE_LICENSE_URL = "https://lic.drmtoday.com/license-proxy-widevine/cenc/?specConform=true"
 WIDEVINE_LICENSE_HEADERS = {
@@ -38,9 +54,24 @@ class Stream:
 
 
 def _get(path, params=None):
-    r = requests.get(BASE_URL + path, params=params, headers=HEADERS, timeout=20)
-    r.raise_for_status()
-    return r.text
+    url = BASE_URL + path
+    if params:
+        url += ("&" if "?" in url else "?") + urllib.parse.urlencode(params)
+    req = urllib.request.Request(url, headers=HEADERS)
+    try:
+        with _URL_OPENER.open(req, timeout=20) as resp:
+            content = resp.read()
+            # Handle possible gzip encoding if returned
+            if resp.headers.get("Content-Encoding") == "gzip":
+                import gzip
+                content = gzip.decompress(content)
+            return content.decode("utf-8", errors="ignore")
+    except urllib.error.HTTPError as e:
+        import xbmc
+        xbmc.log("[plugin.video.rtpplay] HTTP {} for URL: {}. Reason: {}".format(
+            e.code, url, e.reason
+        ), xbmc.LOGERROR)
+        raise
 
 
 def _text(fragment):
@@ -176,11 +207,37 @@ def _parse_items(fragment):
     return items
 
 
-def list_programs(category_id=None, page=1):
+def _sort_key(item):
+    name = item.get("title") or item.get("meta") or ""
+    return "".join(c for c in unicodedata.normalize("NFKD", name.casefold()) if not unicodedata.combining(c)).strip()
+
+
+def list_programs(category_id=None, page=1, sort=True):
     params = {"listtype": "recent", "type": "all", "page": page}
     if category_id:
         params["listcategory"] = category_id
-    return _parse_items(_get("/play/bg_l_pg/", params))
+    items = _parse_items(_get("/play/bg_l_pg/", params))
+    if sort:
+        items.sort(key=_sort_key)
+    return items
+
+
+def list_all_category_programs(category_id=None, max_pages=50):
+    all_items = []
+    seen = set()
+    for page in range(1, max_pages + 1):
+        items = list_programs(category_id=category_id, page=page, sort=False)
+        if not items:
+            break
+        for it in items:
+            pid = it["program_id"]
+            if pid not in seen:
+                seen.add(pid)
+                all_items.append(it)
+        if len(items) < 12:
+            break
+    all_items.sort(key=_sort_key)
+    return all_items
 
 
 def get_category_id(slug):
@@ -245,7 +302,24 @@ def _episode_stream(page):
         if re.search(r"\.(mp3|mp4|m4a|aac)(\?|$)", url):
             return Stream(url, None, False, media_type)
         return _choose_stream({"hls": url}, drm, media_type)
-    return _choose_stream(dict(re.findall(r'(\w+)\s*:\s*"([^"]*)"', f)), drm, media_type)
+
+    sources = dict(re.findall(r'(\w+)\s*:\s*"([^"]*)"', f))
+
+    # Many RTP Play on-demand videos provide unencrypted, stable HLS streams
+    # under /hls/nas2.share/.../master.m3u8 alongside DRM DASH/FairPlay.
+    # Playing unencrypted HLS avoids Android MediaCodec DRM instance collisions
+    # and stalls after a few seconds.
+    file_key = _find(r'fileKey:\s*"([^"]*)"', config)
+    if not file_key:
+        matches = re.findall(r'https://streaming-vod\.rtp\.pt/(?:drm-fps|drm-dash|hls)/([^,\"]+)', config)
+        if matches:
+            file_key = '/' + matches[0].split('.mp4')[0] + '.mp4'
+
+    if file_key and media_type == "video":
+        hls_url = "https://streaming-vod.rtp.pt/hls{}/master.m3u8".format(file_key)
+        return Stream(hls_url, "hls", False, media_type)
+
+    return _choose_stream(sources, drm, media_type)
 
 
 def widevine_license_key():
